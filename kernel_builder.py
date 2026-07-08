@@ -2,12 +2,11 @@
 """
 KernelBuilder - Auto-generate Hashcat OpenCL kernels and modules.
 Python port of the C# tool.
-Auto-generate Hashcat kernels and modules.
+Auto-generate Hashcat OpenCL kernels and modules.
 """
 
 import argparse
 import os
-import re
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -465,46 +464,11 @@ class Interpreter:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def get_presalted_contexts(instructions: List[str]) -> List[str]:
-    """Return contexts whose very first input is salt (eligible for presalt hoisting)."""
-    presalted = []
-    seen = set()
-    for inst in instructions:
-        parts = inst.split(" - ")
-        ctx = parts[0].replace("-", "").replace(" ", "")
-        input_ = parts[1].replace("-", "")
-        if ctx not in seen:
-            seen.add(ctx)
-            if input_ == "salt":
-                presalted.append(ctx)
-    return presalted
-
-
-def resolve_algorithm_from_context(ctx: str) -> str:
-    """Extract algorithm name from context id, e.g. SHA2561 -> SHA256."""
-    m = re.match(r"([A-Za-z]+)\d*", ctx)
-    if m:
-        return m.group(1).upper()
-    return ""
-
-
-def needs_chained_buffers(instructions: List[str]) -> bool:
-    """True if any instruction feeds a previous hash context into another (needs w0-w3 arrays)."""
-    for inst in instructions:
-        input_ = inst.split(" - ")[1].replace("-", "")
-        if input_ not in ("plain", "salt"):
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
 # KernelCodeGenerator
 # ---------------------------------------------------------------------------
 class KernelCodeGenerator:
     @staticmethod
-    def generate_imports(attack_vector: AttackVector, optimized: bool = False) -> CodeList:
+    def generate_imports(attack_vector: AttackVector) -> CodeList:
         code = CodeList()
 
         code.add("""
@@ -575,22 +539,13 @@ class KernelCodeGenerator:
         return code
 
     @staticmethod
-    def generate_header(instructions: List[str], kernel_type: KernelType, attack_vector: AttackVector, hash_mode: str,
-                        optimized: bool = False, tier: str = None, presalted_contexts: List[str] = None) -> CodeList:
-        if presalted_contexts is None:
-            presalted_contexts = []
-
+    def generate_header(instructions: List[str], kernel_type: KernelType, attack_vector: AttackVector, hash_mode: str) -> CodeList:
         code = CodeList()
 
         if kernel_type == KernelType.SingleHash:
             function_name_suffix = "s"
         else:
             function_name_suffix = "m"
-
-        if tier is not None:
-            function_name_suffix = function_name_suffix + tier
-        else:
-            function_name_suffix = function_name_suffix + "xx"
 
         if attack_vector == AttackVector.a0:
             argument = "KERN_ATTR_RULES ()"
@@ -601,7 +556,7 @@ class KernelCodeGenerator:
         else:
             raise NotImplementedError("Unknown -a mode")
 
-        code.add(f"KERNEL_FQ KERNEL_FA void m{hash_mode}_{function_name_suffix} ({argument})", 0)
+        code.add(f"KERNEL_FQ KERNEL_FA void m{hash_mode}_{function_name_suffix}xx ({argument})", 0)
 
         code.add("""
 {
@@ -679,23 +634,7 @@ for (u32 i = 0, idx = 0; i < salt_len; i += 4, idx += 1)
   s[idx] = salt_bufs[SALT_POS_HOST].salt_buf[idx];
 }
 """, 1)
-
-                # Presalt hoisting: for optimized a0/a1, pre-initialize contexts that start with salt
-                if optimized and attack_vector in (AttackVector.a0, AttackVector.a1):
-                    for ctx_name in presalted_contexts:
-                        algo_name = resolve_algorithm_from_context(ctx_name)
-                        if algo_name in SUPPORTED_ALGORITHMS:
-                            algo = parse_algorithm_name(algo_name)
-                            code.add(f"{algo.contextType} {ctx_name}_presalt;")
-                            code.add(f"{algo.initFunction} (&{ctx_name}_presalt);")
-                            if algo.endianness == Endianness.LittleEndian:
-                                code.add(f"{algo.updateFunction}(&{ctx_name}_presalt, s, salt_len);")
-                            else:
-                                code.add(f"{algo.updateSwapFunction}(&{ctx_name}_presalt, s, salt_len);")
                 break
-
-        # Determine if we need w0-w3 arrays for chained hash loading
-        needs_buffers = needs_chained_buffers(instructions)
 
         code.add("""
 
@@ -703,10 +642,7 @@ for (u32 i = 0, idx = 0; i < salt_len; i += 4, idx += 1)
  * loop
  */
 
-""", 1)
-
-        if needs_buffers:
-            code.add("""  u32 w0[4];
+  u32 w0[4];
   u32 w1[4];
   u32 w2[4];
   u32 w3[4];
@@ -724,12 +660,11 @@ for (u32 i = 0, idx = 0; i < salt_len; i += 4, idx += 1)
         if attack_vector == AttackVector.a0:
             code.add("""
 pw_t tmp = PASTE_PW;
-
 tmp.pw_len = apply_rules (rules_buf[il_pos].cmds, tmp.i, tmp.pw_len);
 """, 1)
         elif attack_vector == AttackVector.a3:
             code.add("""
-                                    	
+
 const u32x w0r = words_buf_r[il_pos / VECT_SIZE];
 
 const u32x wStart = w0l | w0r;
@@ -741,11 +676,7 @@ w[0] = wStart;
         return code
 
     @staticmethod
-    def generate_compute(instructions: List[str], attack_vector: AttackVector, optimized: bool = False,
-                         presalted_contexts: List[str] = None) -> CodeList:
-        if presalted_contexts is None:
-            presalted_contexts = []
-
+    def generate_compute(instructions: List[str], attack_vector: AttackVector) -> CodeList:
         code = CodeList()
         code.spacing = 2
 
@@ -753,7 +684,7 @@ w[0] = wStart;
         context_input_counts: Dict[str, int] = {}
 
         for instruction in instructions:
-            ctx = instruction.split(" - ")[0].replace("-", "").replace(" ", "")
+            ctx = instruction.split(" - ")[0].replace("-", "")
             if ctx in context_input_counts:
                 context_input_counts[ctx] += 1
             else:
@@ -767,8 +698,10 @@ w[0] = wStart;
 
             if algorithm_name.startswith("CUT"):
                 cut_length = int(context.split("_")[0].replace("CUT", "")) // 2
+                # Cleanup so the rest of the code doesn't know about the CUT and pretend nothing happened
                 algorithm_name = instruction.split("_")[-1].split("-")[0]
                 instruction = instruction.replace(f"CUT{cut_length}_", "")
+                # Must entirely re-parse
                 current_algorithm = parse_algorithm_name(algorithm_name)
                 context = context.split("_")[-1]
             else:
@@ -779,19 +712,12 @@ w[0] = wStart;
             if context not in context_algorithms:
                 context_algorithms[context] = current_algorithm
 
-                is_presalted = (optimized and attack_vector in (AttackVector.a0, AttackVector.a1) and
-                                context in presalted_contexts and input_ == "salt")
-
-                if is_presalted:
+                if attack_vector != AttackVector.a3:
                     code.add(f"{current_algorithm.contextType} {context};")
-                    code.add(f"{context} = {context}_presalt;")
+                    code.add(f"{current_algorithm.initFunction} (&{context});")
                 else:
-                    if attack_vector != AttackVector.a3:
-                        code.add(f"{current_algorithm.contextType} {context};")
-                        code.add(f"{current_algorithm.initFunction} (&{context});")
-                    else:
-                        code.add(f"{current_algorithm.contextType.replace('_t', '_vector_t')} {context};")
-                        code.add(f"{current_algorithm.initFunction}_vector (&{context});")
+                    code.add(f"{current_algorithm.contextType.replace('_t', '_vector_t')} {context};")
+                    code.add(f"{current_algorithm.initFunction}_vector (&{context});")
 
                 code.add("")
 
@@ -799,11 +725,11 @@ w[0] = wStart;
             if input_.startswith("CUT"):
                 cut_length = int(input_.split("_")[0].replace("CUT", "")) // 2
                 if cut_length % 4 != 0:
-                    raise NotImplementedError("CUT is not supported for values that are not multiples of 4.")
+                    raise NotSupportedError("CUT is not supported for values that are not multiples of 4.")
 
                 context_to_cut = instruction.split("_")[-1].split(" - ")[0].replace("-", "")
                 if context_to_cut not in context_algorithms:
-                    raise NotImplementedError("CUT is not supported on raw values such as $plain or $salt.")
+                    raise NotSupportedError("CUT is not supported on raw values such as $plain or $salt.")
 
                 context_algorithms[context_to_cut].byteLength = cut_length
                 input_ = input_.split("_")[-1]
@@ -834,33 +760,24 @@ w[0] = wStart;
 {current_algorithm.updateFunction}_vector_swap (&{context}, w, pw_len);
 """)
             elif input_ == "salt":
-                is_first_occurrence = True
-                for j in range(idx):
-                    if instructions[j].split(" - ")[0].replace(" ", "").replace("-", "") == context:
-                        is_first_occurrence = False
-                        break
-
-                is_first_salt_presalted = (optimized and attack_vector in (AttackVector.a0, AttackVector.a1) and
-                                           context in presalted_contexts and input_ == "salt" and is_first_occurrence)
-
-                if not is_first_salt_presalted:
-                    if current_algorithm.endianness == Endianness.LittleEndian:
-                        if attack_vector != AttackVector.a3:
-                            code.add(f"{current_algorithm.updateFunction}(&{context}, s, salt_len);")
-                        else:
-                            code.add(f"{current_algorithm.updateFunction}_vector(&{context}, s, salt_len);")
+                if current_algorithm.endianness == Endianness.LittleEndian:
+                    if attack_vector != AttackVector.a3:
+                        code.add(f"{current_algorithm.updateFunction}(&{context}, s, salt_len);")
                     else:
-                        if attack_vector != AttackVector.a3:
-                            code.add(f"{current_algorithm.updateSwapFunction}(&{context}, s, salt_len);")
-                        else:
-                            code.add(f"{current_algorithm.updateVectorSwapFunction}(&{context}, s, salt_len);")
+                        code.add(f"{current_algorithm.updateFunction}_vector(&{context}, s, salt_len);")
+                else:
+                    if attack_vector != AttackVector.a3:
+                        code.add(f"{current_algorithm.updateSwapFunction}(&{context}, s, salt_len);")
+                    else:
+                        code.add(f"{current_algorithm.updateVectorSwapFunction}(&{context}, s, salt_len);")
             elif input_ in context_algorithms:
                 input_algorithm = context_algorithms[input_]
 
+                # TODO: allow this
                 if context not in context_input_counts:
                     raise NotImplementedError("Cannot CUT the outer hash.")
 
-                code.add_range(KernelCodeGenerator.load_buffers(input_algorithm, current_algorithm, context_input_counts[context], optimized))
+                code.add_range(KernelCodeGenerator.load_buffers(input_algorithm, current_algorithm, context_input_counts[context]))
 
                 if input_algorithm.length >= 56 or context_input_counts[context] != 1:
                     if attack_vector != AttackVector.a3:
@@ -874,6 +791,7 @@ w[0] = wStart;
 
             code.add("")
 
+            # If the context name has changed or no more instructions left
             if idx == len(instructions) - 1 or instructions[idx + 1].split(" - ")[0].replace(" ", "").replace("-", "") != context:
                 if attack_vector != AttackVector.a3:
                     code.add(f"{current_algorithm.finalFunction}(&{context});")
@@ -884,22 +802,12 @@ w[0] = wStart;
         return code
 
     @staticmethod
-    def generate_footer(final_context: str, attack_vector: AttackVector, kernel_type: KernelType, optimized: bool = False) -> CodeList:
+    def generate_footer(final_context: str, attack_vector: AttackVector, kernel_type: KernelType) -> CodeList:
         code = CodeList()
 
         final_context = final_context.split(" - ")[0].replace("-", "")
 
         type_ = "M" if kernel_type == KernelType.MultiHash else "S"
-
-        # PATCH: the comparer macro must match whether the hash *context* is
-        # vectorized, not whether -O/optimized was requested. Only -a3
-        # kernels declare NEW_SIMD_CODE (see generate_imports) and use
-        # `_vector_t` contexts / `_final_vector` finalizers; -a0/-a1 kernels
-        # stay scalar (`md5_ctx_t`, `md5_final`) even when optimized, so
-        # COMPARE_*_SIMD is undefined for them and only COMPARE_*_SCALAR
-        # exists. Forcing SIMD for "a3 or optimized" was wrong and caused
-        # "identifier COMPARE_M_SIMD is undefined" build errors on
-        # -a0/-a1 optimized kernels.
         comparer = "SIMD" if attack_vector == AttackVector.a3 else "SCALAR"
 
         code.add(f"COMPARE_{type_}_{comparer} ({final_context}.h[DGST_R0], {final_context}.h[DGST_R1], {final_context}.h[DGST_R2], {final_context}.h[DGST_R3]);", 2)
@@ -910,29 +818,7 @@ w[0] = wStart;
         return code
 
     @staticmethod
-    def generate_stub_kernel(kernel_type: KernelType, attack_vector: AttackVector, hash_mode: str, tier: str) -> CodeList:
-        code = CodeList()
-
-        function_name_suffix = ("s" if kernel_type == KernelType.SingleHash else "m") + tier
-
-        if attack_vector == AttackVector.a0:
-            argument = "KERN_ATTR_RULES ()"
-        elif attack_vector == AttackVector.a1:
-            argument = "KERN_ATTR_BASIC ()"
-        elif attack_vector == AttackVector.a3:
-            argument = "KERN_ATTR_VECTOR ()"
-        else:
-            raise NotImplementedError("Unknown -a mode")
-
-        code.add(f"KERNEL_FQ KERNEL_FA void m{hash_mode}_{function_name_suffix} ({argument})", 0)
-        code.add("{")
-        code.add("}", 0)
-        code.add("")
-
-        return code
-
-    @staticmethod
-    def load_buffers(source: IAlgorithm, target: IAlgorithm, inputs: int, optimized: bool = False) -> CodeList:
+    def load_buffers(source: IAlgorithm, target: IAlgorithm, inputs: int) -> CodeList:
         code = CodeList()
         code.spacing = 2
 
@@ -942,10 +828,12 @@ w[0] = wStart;
         mask_idx = 0
         mask_offsets = [0, 0, 0, 0]
 
+        # Used to load either directly into the context.w buffers, or separate arrays for update_64
         buffer_target = ""
         if source.length <= 56 and inputs == 1:
             buffer_target = f"{target.context}."
 
+        # Set mask offsets for the hex conversion steps
         if source.endianness == target.endianness:
             if source.endianness == Endianness.LittleEndian:
                 conversion = Conversion.LE2LE
@@ -965,6 +853,7 @@ w[0] = wStart;
         while a < source.byteLength:
             b = 0
             while b < 4:
+                # Same internal logic, just different mask offsets so code can be reused safely, just with _le hex conversion
                 suffix = ""
                 if conversion == Conversion.LE2LE or conversion == Conversion.BE2LE:
                     suffix = ""
@@ -985,7 +874,11 @@ w[0] = wStart;
 
                 bytes_processed += 2
 
+                # Skip out if there's still content to hex convert
                 if bytes_processed == source.byteLength:
+                    # 0-out the remaining w0, w1, w2 and w3 buffers for safety
+                    # This shouldn't be necessary but CUDA is annoying
+                    # Just continues using the previous loops for ease. Janky but works
                     if buffer_target == "":
                         b += 1
                         while a < 4:
@@ -1090,16 +983,6 @@ u32         module_salt_type      (MAYBE_UNUSED const hashconfig_t *hashconfig, 
 const char *module_st_hash        (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return ST_HASH;         }
 const char *module_st_pass        (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra) { return ST_PASS;         }
 
-u32 module_pw_max (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED const user_options_t *user_options, MAYBE_UNUSED const user_options_extra_t *user_options_extra)
-{
-  if (hashconfig->opti_type & OPTI_TYPE_OPTIMIZED_KERNEL)
-  {
-    return 31;
-  }
-
-  return PW_MAX;
-}
-
 int module_hash_decode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSED void *digest_buf, MAYBE_UNUSED salt_t *salt, MAYBE_UNUSED void *esalt_buf, MAYBE_UNUSED void *hook_salt_buf, MAYBE_UNUSED hashinfo_t *hash_info, const char *line_buf, MAYBE_UNUSED const int line_len)
 {
 """)
@@ -1198,6 +1081,9 @@ int module_hash_encode (MAYBE_UNUSED const hashconfig_t *hashconfig, MAYBE_UNUSE
 
         code.add("""
 const u32 *digest = (const u32 *) digest_buf;
+
+// we can not change anything in the original buffer, otherwise destroying sorting
+// therefore create some local buffer
 
 """)
 
@@ -1321,7 +1207,7 @@ module_ctx->module_potfile_custom_check     = MODULE_DEFAULT;
 module_ctx->module_potfile_disable          = MODULE_DEFAULT;
 module_ctx->module_potfile_keep_all_hashes  = MODULE_DEFAULT;
 module_ctx->module_pwdump_column            = MODULE_DEFAULT;
-module_ctx->module_pw_max                   = module_pw_max;
+module_ctx->module_pw_max                   = MODULE_DEFAULT;
 module_ctx->module_pw_min                   = MODULE_DEFAULT;
 module_ctx->module_salt_max                 = MODULE_DEFAULT;
 module_ctx->module_salt_min                 = MODULE_DEFAULT;
@@ -1356,49 +1242,29 @@ def create_folder_structure(ID: str, overwrite: bool, hashcat: bool):
     os.makedirs(f"{prefix}OpenCL", exist_ok=True)
 
 
-def generate_kernels(instructions: List[str], ID: str, hashcat: bool, build_optimized: bool = True):
+def generate_kernels(instructions: List[str], ID: str, hashcat: bool):
     prefix = ""
     if not hashcat:
         prefix = f"plugins/{ID}/"
 
     attack_vectors = [AttackVector.a0, AttackVector.a1, AttackVector.a3]
-
-    presalted = get_presalted_contexts(instructions) if build_optimized else []
-
     for attack_vector in attack_vectors:
         # Generate pure kernel
         kernel_code = CodeList()
 
-        kernel_code.add_range(KernelCodeGenerator.generate_imports(attack_vector, optimized=False))
+        kernel_code.add_range(KernelCodeGenerator.generate_imports(attack_vector))
 
-        kernel_code.add_range(KernelCodeGenerator.generate_header(instructions, KernelType.MultiHash, attack_vector, ID, optimized=False))
-        kernel_code.add_range(KernelCodeGenerator.generate_compute(instructions, attack_vector, optimized=False))
-        kernel_code.add_range(KernelCodeGenerator.generate_footer(instructions[-1], attack_vector, KernelType.MultiHash, optimized=False))
+        kernel_code.add_range(KernelCodeGenerator.generate_header(instructions, KernelType.MultiHash, attack_vector, ID))
+        kernel_code.add_range(KernelCodeGenerator.generate_compute(instructions, attack_vector))
+        kernel_code.add_range(KernelCodeGenerator.generate_footer(instructions[-1], attack_vector, KernelType.MultiHash))
 
-        kernel_code.add_range(KernelCodeGenerator.generate_header(instructions, KernelType.SingleHash, attack_vector, ID, optimized=False))
-        kernel_code.add_range(KernelCodeGenerator.generate_compute(instructions, attack_vector, optimized=False))
-        kernel_code.add_range(KernelCodeGenerator.generate_footer(instructions[-1], attack_vector, KernelType.SingleHash, optimized=False))
+        kernel_code.add_range(KernelCodeGenerator.generate_header(instructions, KernelType.SingleHash, attack_vector, ID))
+        kernel_code.add_range(KernelCodeGenerator.generate_compute(instructions, attack_vector))
+        kernel_code.add_range(KernelCodeGenerator.generate_footer(instructions[-1], attack_vector, KernelType.SingleHash))
 
         path = f"{prefix}OpenCL/m{ID}_{attack_vector.name}-pure.cl"
         with open(path, "w") as f:
             f.write("\n".join(kernel_code) + "\n")
-
-        if build_optimized:
-            opt_code = CodeList()
-
-            opt_code.add_range(KernelCodeGenerator.generate_imports(attack_vector, optimized=True))
-
-            for kernel_type in (KernelType.MultiHash, KernelType.SingleHash):
-                opt_code.add_range(KernelCodeGenerator.generate_header(instructions, kernel_type, attack_vector, ID, optimized=True, tier="04", presalted_contexts=presalted))
-                opt_code.add_range(KernelCodeGenerator.generate_compute(instructions, attack_vector, optimized=True, presalted_contexts=presalted))
-                opt_code.add_range(KernelCodeGenerator.generate_footer(instructions[-1], attack_vector, kernel_type, optimized=True))
-
-                for tier in ("08", "16"):
-                    opt_code.add_range(KernelCodeGenerator.generate_stub_kernel(kernel_type, attack_vector, ID, tier))
-
-            opt_path = f"{prefix}OpenCL/m{ID}_{attack_vector.name}-optimized.cl"
-            with open(opt_path, "w") as f:
-                f.write("\n".join(opt_code) + "\n")
 
 
 def generate_module(algorithm: str, instructions: List[str], ID: str, hashcat: bool):
@@ -1439,7 +1305,6 @@ def main():
   python3 kernel_builder.py 'sha224($plain)' 98002
   python3 kernel_builder.py 'sha256($salt.$plain)' 98003
   python3 kernel_builder.py 'md5(sha1($plain))' 98004 --hashcat
-  python3 kernel_builder.py 'sha256($plain)' 98005 --no-optimized
 """
 
     parser = argparse.ArgumentParser(
@@ -1451,16 +1316,6 @@ def main():
     parser.add_argument("ID", nargs="?", help="Kernel ID / -m number (1-5 digits)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite previously created kernels")
     parser.add_argument("--hashcat", action="store_true", help="Output directly to Hashcat directories")
-    parser.add_argument("--optimized", dest="optimized", action="store_true",
-                         help="Force generation of -optimized.cl kernels (a0/a1/a3). WARNING: these kernels "
-                              "are currently just the -pure.cl body relabeled under optimized-kernel filenames, "
-                              "not real hashcat-style vectorized/inlined transforms, and have caused GPU "
-                              "'illegal memory access' crashes under -O for both salted and unsalted hashes. "
-                              "Off by default; use at your own risk.")
-    parser.add_argument("--no-optimized", dest="optimized", action="store_false",
-                         help="Skip generating -optimized.cl kernels; only the -pure.cl kernels are produced. "
-                              "This is already the default.")
-    parser.set_defaults(optimized=None)
     parser.add_argument("-l", "--list", action="store_true", help="List supported algorithms and exit")
     args = parser.parse_args()
 
@@ -1484,15 +1339,10 @@ def main():
     ID = ID.zfill(5)
 
     instructions = Interpreter.generate_instructions(algorithm)
-    
-    if args.optimized is None:
-        build_optimized = False
-    else:
-        build_optimized = args.optimized
 
     create_folder_structure(ID, overwrite, hashcat)
 
-    generate_kernels(instructions, ID, hashcat, build_optimized)
+    generate_kernels(instructions, ID, hashcat)
     generate_module(algorithm, instructions, ID, hashcat)
 
     if hashcat:
