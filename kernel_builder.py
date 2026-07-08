@@ -1484,21 +1484,7 @@ def main():
     ID = ID.zfill(5)
 
     instructions = Interpreter.generate_instructions(algorithm)
-
-    # PATCH (superseded, kept for history -- see below): an earlier version
-    # of this logic defaulted -optimized.cl generation on for salted hashes
-    # only, on the theory that the crash seen on unsalted raw MD5 was tied
-    # to salt handling. A real-hardware run of -m 98001 (sha224($salt.$plain),
-    # salted, -O) produced the identical "illegal memory access" / kernel
-    # autotune failure. That disproves the salted/unsalted distinction: the
-    # -optimized.cl kernels this generator emits are, structurally, just the
-    # -pure.cl body relabeled under optimized-kernel filenames -- not a real
-    # hashcat-style vectorized/inlined transform (confirmed against
-    # hashcat/hashcat@master's m00000_a0-optimized.cl) -- and that mismatch
-    # is unsafe regardless of whether the hash is salted. So -optimized.cl
-    # generation now defaults OFF unconditionally; pass --optimized to force
-    # it on (at your own risk, until real per-algorithm optimized transforms
-    # are implemented) for either salted or unsalted hashes.
+    
     if args.optimized is None:
         build_optimized = False
     else:
