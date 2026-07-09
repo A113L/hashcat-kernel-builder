@@ -1,6 +1,6 @@
 # KernelBuilder
 
-> Python port of the original C# tool. Auto-generates Hashcat OpenCL kernels and modules from PHP-like hash expressions ,eg (md5(sha1($plain).sha256($salt))).
+> Python port of the original C# tool. Auto-generates Hashcat OpenCL kernels and modules from PHP-like hash expressions like (md5(sha1($plain).sha256($salt))).
 
 KernelBuilder takes a simple expression like `md5($plain.$salt)` or `sha1(md5($plain))` and automatically generates a complete Hashcat plugin: **pure** OpenCL kernels for attack modes `-a 0`, `-a 1`, and `-a 3`, plus the C module for hash parsing and encoding.
 
