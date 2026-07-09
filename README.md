@@ -52,6 +52,7 @@ python3 kernel_builder.py 'sha1($plain.$salt)' 98001
 python3 kernel_builder.py 'sha224($salt.$plain)' 98002
 python3 kernel_builder.py 'sha256($salt.$plain)' 98003
 python3 kernel_builder.py 'md5(sha1($plain))' 98004 --hashcat
+python3 kernel_builder.py 'sha256($salt.CUT16_md5($plain))' 92000 --overwrite
 ```
 
 ### Output layout (without `--hashcat`)
