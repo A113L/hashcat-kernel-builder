@@ -1250,13 +1250,18 @@ static const u32   DGST_POS3      = 1;
 
         # Detect whether any step in the chain consumes $salt, to decide the
         # hash category and salt-related module behavior below.
-        salted = False
-        for instruction in instructions:
-            if "salt" in instruction:
-                salted = True
-                code.add("static const u32   HASH_CATEGORY  = HASH_CATEGORY_RAW_HASH_SALTED;")
+        #
+        # NOTE: this used to add the HASH_CATEGORY line once per instruction
+        # that referenced $salt (inside the loop), which produced duplicate
+        # "static const u32 HASH_CATEGORY = ..." declarations - and a
+        # compile error - whenever more than one instruction consumed
+        # $salt (e.g. sha1($salt.md5($salt.$plain))). We now only detect
+        # whether salt is used at all, and emit the declaration exactly once.
+        salted = any("salt" in instruction for instruction in instructions)
 
-        if not salted:
+        if salted:
+            code.add("static const u32   HASH_CATEGORY  = HASH_CATEGORY_RAW_HASH_SALTED;")
+        else:
             code.add("static const u32 HASH_CATEGORY = HASH_CATEGORY_RAW_HASH;")
 
         code.add(f'static const char *HASH_NAME      = "{algorithm}";')
@@ -1565,13 +1570,14 @@ module_ctx->module_warmup_disable           = MODULE_DEFAULT;
 # ---------------------------------------------------------------------------
 # Program
 # ---------------------------------------------------------------------------
-def create_folder_structure(ID: str, overwrite: bool, hashcat: bool):
+def create_folder_structure(ID: str, overwrite: bool, hashcat: bool, hashcat_path: str = ""):
     """
     Create the output directory layout for the generated plugin:
       plugins/<ID>/OpenCL/       (kernel .cl files)
       plugins/<ID>/src/modules/  (module .c file)
-    Or, if --hashcat was passed, write directly into the current directory's
-    OpenCL/ and src/modules/ (i.e. straight into a Hashcat source checkout).
+    Or, if --hashcat was passed, write directly into <hashcat_path>/OpenCL/
+    and <hashcat_path>/src/modules/ (i.e. straight into a Hashcat source
+    checkout at the path the user provided).
     Refuses to overwrite an existing plugins/<ID> folder unless --overwrite
     or --hashcat is given.
     """
@@ -1583,20 +1589,70 @@ def create_folder_structure(ID: str, overwrite: bool, hashcat: bool):
     if not hashcat:
         prefix = f"plugins/{ID}/"
         os.makedirs(prefix, exist_ok=True)
+    else:
+        prefix = f"{hashcat_path.rstrip('/')}/" if hashcat_path else ""
 
     os.makedirs(f"{prefix}src/modules", exist_ok=True)
     os.makedirs(f"{prefix}OpenCL", exist_ok=True)
 
 
-def generate_kernels(instructions: List[str], ID: str, hashcat: bool):
+def prompt_for_hashcat_path() -> str:
+    """
+    Interactively ask the user for the path to their local Hashcat
+    source/installation directory (the one containing OpenCL/ and
+    src/modules/), used as the write target when --hashcat is passed.
+    Keeps asking until a usable, existing directory is given, or the user
+    aborts.
+    """
+    print()
+    print("The --hashcat flag requires the path to your Hashcat directory")
+    print("(the one containing OpenCL/ and src/modules/).")
+    print()
+
+    while True:
+        try:
+            path = input("Enter the path to your Hashcat directory: ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(1)
+
+        if not path:
+            print("The path cannot be empty. Please try again (Ctrl+C to abort).")
+            continue
+
+        path = os.path.expanduser(path)
+
+        if not os.path.isdir(path):
+            answer = input(f'Directory "{path}" does not exist. Enter a different path? [Y/n]: ').strip().lower()
+            if answer == "n":
+                print("Aborted.")
+                sys.exit(1)
+            continue
+
+        # Sanity check: a real Hashcat checkout has a top-level "src" dir
+        # (and usually "OpenCL" too). Warn, but let the user override it,
+        # in case they're pointing at a non-standard layout.
+        looks_like_hashcat = os.path.isdir(os.path.join(path, "src"))
+
+        if not looks_like_hashcat:
+            print(f'Warning: directory "{path}" does not look like a Hashcat source tree (no "src/" found).')
+            answer = input("Use this path anyway? [y/N]: ").strip().lower()
+            if answer != "y":
+                continue
+
+        return path.rstrip("/")
+
+
+def generate_kernels(instructions: List[str], ID: str, hashcat: bool, hashcat_path: str = ""):
     """
     For each supported attack vector (a0, a1, a3), generate one pure kernel
     file containing both the multi-hash and single-hash kernel functions
     back-to-back, and write it to OpenCL/m<ID>_<a0|a1|a3>-pure.cl.
     """
-    prefix = ""
     if not hashcat:
         prefix = f"plugins/{ID}/"
+    else:
+        prefix = f"{hashcat_path.rstrip('/')}/" if hashcat_path else ""
 
     attack_vectors = [AttackVector.a0, AttackVector.a1, AttackVector.a3]
     for attack_vector in attack_vectors:
@@ -1622,11 +1678,12 @@ def generate_kernels(instructions: List[str], ID: str, hashcat: bool):
             f.write("\n".join(kernel_code) + "\n")
 
 
-def generate_module(algorithm: str, instructions: List[str], ID: str, hashcat: bool):
+def generate_module(algorithm: str, instructions: List[str], ID: str, hashcat: bool, hashcat_path: str = ""):
     """Generate and write the module_<ID>.c file described by ModuleCodeGenerator."""
-    prefix = ""
     if not hashcat:
         prefix = f"plugins/{ID}/"
+    else:
+        prefix = f"{hashcat_path.rstrip('/')}/" if hashcat_path else ""
 
     module_code = CodeList()
     module_code.add_range(ModuleCodeGenerator.generate_module(algorithm, instructions, ID))
@@ -1663,6 +1720,7 @@ def main():
   python3 kernel_builder.py 'sha224($plain)' 98002
   python3 kernel_builder.py 'sha256($salt.$plain)' 98003
   python3 kernel_builder.py 'md5(sha1($plain))' 98004 --hashcat
+  python3 kernel_builder.py 'md5(sha1($plain))' 98004 --hashcat --hashcat-path /home/user/hashcat
 """
 
     parser = argparse.ArgumentParser(
@@ -1673,7 +1731,10 @@ def main():
     parser.add_argument("algorithm", nargs="?", help="Algorithm expression, e.g. 'md5($plain)' or 'sha1($plain.$salt)'")
     parser.add_argument("ID", nargs="?", help="Kernel ID / -m number (1-5 digits)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite previously created kernels")
-    parser.add_argument("--hashcat", action="store_true", help="Output directly to Hashcat directories")
+    parser.add_argument("--hashcat", action="store_true", help="Output directly to a Hashcat directory instead of plugins/<ID>")
+    parser.add_argument("--hashcat-path", metavar="PATH", default=None,
+                         help="Path to the Hashcat directory to write into (used with --hashcat). "
+                              "If omitted, you will be prompted for it interactively.")
     parser.add_argument("-l", "--list", action="store_true", help="List supported algorithms and exit")
     args = parser.parse_args()
 
@@ -1690,6 +1751,21 @@ def main():
     overwrite = args.overwrite
     hashcat = args.hashcat
 
+    hashcat_path = ""
+    if hashcat:
+        if args.hashcat_path:
+            # Path given non-interactively on the command line: still
+            # validate it so we fail fast with a clear message instead of
+            # a raw FileNotFoundError deep inside file-writing code.
+            candidate = os.path.expanduser(args.hashcat_path)
+            if not os.path.isdir(candidate):
+                print(f'Error: the given --hashcat-path "{candidate}" does not exist.', file=sys.stderr)
+                sys.exit(1)
+            hashcat_path = candidate.rstrip("/")
+        else:
+            # No path given up front -> ask interactively.
+            hashcat_path = prompt_for_hashcat_path()
+
     # Hashcat -m mode numbers must be a plain 1-5 digit numeric string.
     if not ID.isdigit() or len(ID) > 5 or len(ID) == 0:
         print(f'The ID "{ID}" must be a 1-5 digit number. ex: 98000')
@@ -1702,13 +1778,13 @@ def main():
     # downstream generator consumes.
     instructions = Interpreter.generate_instructions(algorithm)
 
-    create_folder_structure(ID, overwrite, hashcat)
+    create_folder_structure(ID, overwrite, hashcat, hashcat_path)
 
-    generate_kernels(instructions, ID, hashcat)
-    generate_module(algorithm, instructions, ID, hashcat)
+    generate_kernels(instructions, ID, hashcat, hashcat_path)
+    generate_module(algorithm, instructions, ID, hashcat, hashcat_path)
 
     if hashcat:
-        print("Plugin has been stored in the Hashcat folders")
+        print(f"Plugin has been stored in {hashcat_path}")
         print("")
         print("Compile Hashcat using: https://github.com/hashcat/hashcat/blob/master/BUILD.md")
     else:
