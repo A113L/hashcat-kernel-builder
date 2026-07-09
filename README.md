@@ -33,7 +33,7 @@ This version intentionally generates **pure kernels only**. An earlier iteration
 ## Usage
 
 ```
-python3 kernel_builder.py <algorithm> <ID> [--overwrite] [--hashcat] [--list]
+python3 kernel_builder.py <algorithm> <ID> [--overwrite] [--hashcat] [--list] [--hashcat-path PATH]
 ```
 
 | Argument | Description |
