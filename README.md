@@ -4,8 +4,6 @@
 
 KernelBuilder takes a simple expression like `md5($plain.$salt)` or `sha1(md5($plain))` and automatically generates a complete Hashcat plugin: **pure** OpenCL kernels for attack modes `-a 0`, `-a 1`, and `-a 3`, plus the C module for hash parsing and encoding.
 
-This version intentionally generates **pure kernels only**. An earlier iteration also generated `-optimized.cl` kernels for use with Hashcat's `-O` flag, but those triggered build/runtime errors on some algorithm combinations (particularly big-endian chained hashes on `-a 0`/`-a 1`), so optimized-kernel generation was dropped in favor of a simpler, reliably-working pure-kernel-only build. `-a 3` optimized kernels did work correctly, but for consistency this script keeps all three attack modes on pure kernels.
-
 ---
 
 ## Features
