@@ -41,6 +41,7 @@ python3 kernel_builder.py <algorithm> <ID> [--overwrite] [--hashcat] [--list] [-
 | `algorithm` | Hash expression, e.g. `'md5($plain)'`, `'sha1($plain.$salt)'` |
 | `ID` | Kernel ID / Hashcat `-m` number (1-5 digits, e.g. `98000`) |
 | `--overwrite` | Overwrite a previously generated plugin folder |
+| `--hashcat-path PATH` | Path to the Hashcat directory to write into (used with --hashcat). If omitted, you will be prompted for it interactively.|
 | `--hashcat` | Write directly into a Hashcat source tree's `OpenCL/` and `src/modules/` folders instead of `plugins/<ID>/` |
 | `-l`, `--list` | List supported algorithms and exit |
 
